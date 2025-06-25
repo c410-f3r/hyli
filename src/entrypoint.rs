@@ -24,6 +24,7 @@ use hydentity::Hydentity;
 use hyle_crypto::SharedBlstCrypto;
 use hyle_modules::{
     modules::{
+        admin::{AdminApi, AdminApiRunContext},
         bus_ws_connector::{NodeWebsocketConnector, NodeWebsocketConnectorCtx, WebsocketOutEvent},
         contract_state_indexer::{ContractStateIndexer, ContractStateIndexerCtx},
         da_listener::{DAListener, DAListenerConf},
@@ -284,6 +285,20 @@ async fn common_main(
                 api: build_api_ctx.clone(),
             })
             .await?;
+        handler
+            .build_module::<ContractStateIndexer<AccountSMT>>(ContractStateIndexerCtx {
+                contract_name: "oxygen".into(),
+                data_directory: config.data_directory.clone(),
+                api: build_api_ctx.clone(),
+            })
+            .await?;
+        handler
+            .build_module::<ContractStateIndexer<AccountSMT>>(ContractStateIndexerCtx {
+                contract_name: "vitamin".into(),
+                data_directory: config.data_directory.clone(),
+                api: build_api_ctx.clone(),
+            })
+            .await?;
     }
 
     if config.p2p.mode != conf::P2pMode::None {
@@ -329,6 +344,7 @@ async fn common_main(
                 data_directory: config.data_directory.clone(),
                 da_read_from: config.da_read_from.clone(),
                 start_block: None,
+                timeout_client_secs: config.da_timeout_client_secs,
             })
             .await?;
     }
@@ -374,6 +390,16 @@ async fn common_main(
                 )
                 .with_registry(registry),
             )
+            .await?;
+    }
+
+    if config.run_admin_server {
+        handler
+            .build_module::<AdminApi>(AdminApiRunContext::new(
+                config.admin_server_port,
+                Router::new(),
+                config.admin_server_max_body_size,
+            ))
             .await?;
     }
 

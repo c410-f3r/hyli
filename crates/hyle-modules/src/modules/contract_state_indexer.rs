@@ -102,8 +102,29 @@ where
         })
     }
 
-    fn run(&mut self) -> impl futures::Future<Output = Result<()>> + Send {
-        self.start()
+    async fn run(&mut self) -> Result<()> {
+        module_handle_messages! {
+            on_self self,
+            listen<NodeStateEvent> event => {
+                _ = log_error!(
+                    self.handle_node_state_event(event).await,
+                    "Handling node state event"
+                )
+            }
+        };
+
+        Ok(())
+    }
+
+    async fn persist(&mut self) -> Result<()> {
+        if let Err(e) = Self::save_on_disk::<ContractStateStore<State>>(
+            self.file.as_path(),
+            self.store.read().await.deref(),
+        ) {
+            tracing::warn!(cn = %self.contract_name, "Failed to save contract state indexer on disk: {}", e);
+        }
+
+        Ok(())
     }
 }
 
@@ -119,25 +140,6 @@ where
         + 'static,
     Event: std::fmt::Debug + Clone + Send + Sync + 'static,
 {
-    pub async fn start(&mut self) -> Result<(), Error> {
-        module_handle_messages! {
-            on_bus self.bus,
-            listen<NodeStateEvent> event => {
-                _ = log_error!(self.handle_node_state_event(event)
-                    .await,
-                    "Handling node state event")
-            }
-        };
-
-        if let Err(e) = Self::save_on_disk::<ContractStateStore<State>>(
-            self.file.as_path(),
-            self.store.read().await.deref(),
-        ) {
-            tracing::warn!(cn = %self.contract_name, "Failed to save contract state indexer on disk: {}", e);
-        }
-        Ok(())
-    }
-
     /// Note: Each copy of the contract state indexer does the same handle_block on each data event
     /// coming from node state.
     async fn handle_node_state_event(&mut self, event: NodeStateEvent) -> Result<(), Error> {
@@ -160,10 +162,9 @@ where
         for tx in txs {
             let dp_hash = block.resolve_parent_dp_hash(tx)?.clone();
             let tx_id = TxId(dp_hash.clone(), tx.clone());
-            let tx_context = block.build_tx_ctx(tx)?;
 
             let mut store = self.store.write().await;
-            let tx = match if remove_from_unsettled {
+            let (tx, tx_context) = match if remove_from_unsettled {
                 store.unsettled_blobs.remove(&tx_id)
             } else {
                 store.unsettled_blobs.get(&tx_id).cloned()
@@ -207,7 +208,7 @@ where
     }
 
     async fn handle_processed_block(&mut self, block: Block) -> Result<()> {
-        for (_, contract, metadata) in &block.registered_contracts {
+        for (_, contract, metadata) in block.registered_contracts.values() {
             if self.contract_name == contract.contract_name {
                 self.handle_register_contract(contract, metadata).await?;
             }
@@ -219,7 +220,9 @@ where
 
         for (tx_id, tx) in &block.txs {
             if let TransactionData::Blob(tx) = &tx.transaction_data {
-                self.handle_blob(tx_id.clone(), tx.clone()).await?;
+                let tx_context = block.build_tx_ctx(&tx.hashed())?;
+                self.handle_blob(tx_id.clone(), tx.clone(), tx_context)
+                    .await?;
             }
         }
 
@@ -235,7 +238,7 @@ where
             &block.timed_out_txs,
             &block,
             |state, tx, index, ctx| state.handle_transaction_timeout(tx, index, ctx),
-            false,
+            true,
         )
         .await?;
 
@@ -243,7 +246,7 @@ where
             &block.failed_txs,
             &block,
             |state, tx, index, ctx| state.handle_transaction_failed(tx, index, ctx),
-            false,
+            true,
         )
         .await?;
 
@@ -258,7 +261,12 @@ where
         Ok(())
     }
 
-    async fn handle_blob(&mut self, tx_id: TxId, tx: BlobTransaction) -> Result<()> {
+    async fn handle_blob(
+        &mut self,
+        tx_id: TxId,
+        tx: BlobTransaction,
+        tx_context: TxContext,
+    ) -> Result<()> {
         let mut found_supported_blob = false;
 
         for b in &tx.blobs {
@@ -270,7 +278,11 @@ where
 
         if found_supported_blob {
             debug!(cn = %self.contract_name, "⚒️  Found supported blob in transaction: {}", tx_id);
-            self.store.write().await.unsettled_blobs.insert(tx_id, tx);
+            self.store
+                .write()
+                .await
+                .unsettled_blobs
+                .insert(tx_id, (tx, tx_context));
         }
 
         Ok(())
@@ -337,6 +349,9 @@ mod tests {
         ) -> Result<Self> {
             Ok(Self::default())
         }
+        fn get_state_commitment(&self) -> StateCommitment {
+            self.commit()
+        }
     }
 
     impl ContractHandler for MockState {
@@ -402,11 +417,16 @@ mod tests {
         };
         let tx = BlobTransaction::new("test", vec![blob]);
         let tx_hash = tx.hashed();
+        let tx_context = TxContext::default();
 
         let mut indexer = build_indexer(contract_name.clone()).await;
         register_contract(&mut indexer).await;
         indexer
-            .handle_blob(TxId(DataProposalHash::default(), tx_hash.clone()), tx)
+            .handle_blob(
+                TxId(DataProposalHash::default(), tx_hash.clone()),
+                tx,
+                tx_context,
+            )
             .await
             .unwrap();
 
@@ -426,12 +446,15 @@ mod tests {
         };
         let tx = BlobTransaction::new("test", vec![blob]);
         let tx_id = TxId(DataProposalHash::default(), tx.hashed());
+        let tx_context = TxContext::default();
 
         let mut indexer = build_indexer(contract_name.clone()).await;
         register_contract(&mut indexer).await;
         {
             let mut store = indexer.store.write().await;
-            store.unsettled_blobs.insert(tx_id.clone(), tx);
+            store
+                .unsettled_blobs
+                .insert(tx_id.clone(), (tx, tx_context));
         }
 
         indexer

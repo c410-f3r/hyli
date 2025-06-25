@@ -8,8 +8,11 @@ pub struct NodeStateMetrics {
     module_name: &'static str,
     processed_blocks: Counter<u64>,
     unsettled_transactions: Gauge<u64>,
+    scheduled_timeouts: Gauge<u64>,
     contracts: Gauge<u64>,
     settled_transactions: Counter<u64>,
+    failed_transactions: Counter<u64>,
+    successful_transactions: Counter<u64>,
     current_height: Gauge<u64>,
     triggered_timeouts: Counter<u64>,
 }
@@ -29,11 +32,20 @@ impl NodeStateMetrics {
             unsettled_transactions: my_meter
                 .u64_gauge(format!("{node_state}_unsettled_transactions"))
                 .build(),
+            scheduled_timeouts: my_meter
+                .u64_gauge(format!("{node_state}_scheduled_timeouts"))
+                .build(),
             contracts: my_meter
                 .u64_gauge(format!("{node_state}_contracts"))
                 .build(),
             settled_transactions: my_meter
                 .u64_counter(format!("{node_state}_settled_transactions"))
+                .build(),
+            failed_transactions: my_meter
+                .u64_counter(format!("{node_state}_failed_transactions"))
+                .build(),
+            successful_transactions: my_meter
+                .u64_counter(format!("{node_state}_successful_transactions"))
                 .build(),
             current_height: my_meter
                 .u64_gauge(format!("{node_state}_current_height"))
@@ -56,8 +68,20 @@ impl NodeStateMetrics {
         self.settled_transactions
             .add(value, &[KeyValue::new("module_name", self.module_name)]);
     }
+    pub fn add_failed_transactions(&self, value: u64) {
+        self.failed_transactions
+            .add(value, &[KeyValue::new("module_name", self.module_name)]);
+    }
+    pub fn add_successful_transactions(&self, value: u64) {
+        self.successful_transactions
+            .add(value, &[KeyValue::new("module_name", self.module_name)]);
+    }
     pub fn record_unsettled_transactions(&self, value: u64) {
         self.unsettled_transactions
+            .record(value, &[KeyValue::new("module_name", self.module_name)])
+    }
+    pub fn record_scheduled_timeouts(&self, value: u64) {
+        self.scheduled_timeouts
             .record(value, &[KeyValue::new("module_name", self.module_name)])
     }
     pub fn record_contracts(&self, value: u64) {

@@ -33,7 +33,7 @@ use std::ops::DerefMut;
 use std::time::Duration;
 use std::{collections::HashMap, default::Default, path::PathBuf};
 use tokio::time::interval;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, info, trace};
 
 pub mod api;
 pub mod metrics;
@@ -285,10 +285,11 @@ impl Consensus {
             debug!("👑 I'm the new leader! 👑")
         } else {
             self.bft_round_state.state_tag = StateTag::Follower;
-            self.bft_round_state
+            self.store
+                .bft_round_state
                 .timeout
                 .state
-                .schedule_next(TimestampMsClock::now());
+                .schedule_next(TimestampMsClock::now(), self.config.consensus.timeout_after);
         }
 
         Ok(())
@@ -631,7 +632,9 @@ impl Consensus {
                         self.store.bft_round_state.current_proposal = ConsensusProposal {
                             slot: block.block_height.0,
                             ..Default::default()
-                        }
+                        };
+
+                        self.bft_round_state.timeout.requests.clear();
                     }
                 }
                 Ok(())
@@ -653,8 +656,7 @@ impl Consensus {
     fn broadcast_net_message(&mut self, net_message: ConsensusNetMessage) -> Result<()> {
         let signed_msg = self.sign_net_message(net_message)?;
         let enum_variant_name: &'static str = (&signed_msg.msg).into();
-        _ = self
-            .bus
+        self.bus
             .send(OutboundMessage::broadcast(signed_msg))
             .context(format!(
                 "Failed to broadcast {} msg on the bus",
@@ -671,8 +673,7 @@ impl Consensus {
     ) -> Result<()> {
         let signed_msg = self.sign_net_message(net_message)?;
         let enum_variant_name: &'static str = (&signed_msg.msg).into();
-        _ = self
-            .bus
+        self.bus
             .send(OutboundMessage::send(to, signed_msg))
             .context(format!(
                 "Failed to send {} msg on the bus",
@@ -683,13 +684,13 @@ impl Consensus {
 
     async fn wait_genesis(&mut self) -> Result<()> {
         let should_shutdown = module_handle_messages! {
-            on_bus self.bus,
+            on_self self,
             listen<GenesisEvent> msg => {
                 match msg {
                     GenesisEvent::GenesisBlock(signed_block) => {
                         // Wait until we have processed the genesis block to update our Staking.
                         module_handle_messages! {
-                            on_bus self.bus,
+                            on_self self,
                             listen<NodeStateEvent> event => {
                                 let NodeStateEvent::NewBlock(block) = &event;
                                 if block.block_height.0 != 0 {
@@ -742,7 +743,7 @@ impl Consensus {
                         // TODO: this logic can be improved.
                         self.bft_round_state.state_tag = StateTag::Joining;
                         // Set up an initial timeout to ensure we don't get stuck if we miss commits
-                        self.bft_round_state.timeout.state.schedule_next(TimestampMsClock::now());
+                        self.store.bft_round_state.timeout.state.schedule_next(TimestampMsClock::now(), self.config.consensus.timeout_after);
 
                         break;
                     },
@@ -770,7 +771,7 @@ impl Consensus {
         timeout_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         module_handle_messages! {
-            on_bus self.bus,
+            on_self self,
             listen<NodeStateEvent> event => {
                 let _ = log_error!(self.handle_node_state_event(event).await, "Error while handling data event");
             }
@@ -784,8 +785,9 @@ impl Consensus {
                 let slot = self.bft_round_state.slot;
                 let view = self.bft_round_state.view;
                 let round_leader = self.round_leader()?;
+                let last_timestamp = self.bft_round_state.parent_timestamp.clone();
                 let validators = self.bft_round_state.staking.bonded().clone();
-                Ok(ConsensusInfo { slot, view, round_leader, validators })
+                Ok(ConsensusInfo { slot, view, round_leader, last_timestamp, validators })
             }
             command_response<QueryConsensusStakingState, Staking> _ => {
                 Ok(self.bft_round_state.staking.clone())
@@ -794,12 +796,6 @@ impl Consensus {
                 log_error!(self.bus.send(ConsensusCommand::TimeoutTick), "Cannot send message over channel")?;
             }
         };
-
-        if let Some(file) = &self.file {
-            if let Err(e) = Self::save_on_disk(file.as_path(), &self.store) {
-                warn!("Failed to save consensus storage on disk: {}", e);
-            }
-        }
 
         Ok(())
     }
@@ -825,8 +821,14 @@ pub mod test {
         rest::RestApi,
         utils::integration_test::NodeIntegrationCtxBuilder,
     };
-    use hyle_modules::{handle_messages, node_state::module::NodeStateModule};
+    use hyle_modules::{
+        handle_messages,
+        node_state::{
+            metrics::NodeStateMetrics, module::NodeStateModule, NodeState, NodeStateStore,
+        },
+    };
     use std::{future::Future, pin::Pin, sync::Arc};
+    use tracing::warn;
 
     use super::*;
     use crate::{
@@ -881,6 +883,7 @@ pub mod test {
             let store = ConsensusStore::default();
             let mut conf = Conf::default();
             conf.consensus.slot_duration = Duration::from_millis(1000);
+            conf.consensus.timeout_after = Duration::from_millis(5000);
             let bus = ConsensusBusClient::new_from_bus(shared_bus.new_handle()).await;
 
             Consensus {
@@ -957,10 +960,14 @@ pub mod test {
         pub async fn timeout(nodes: &mut [&mut ConsensusTestCtx]) {
             for n in nodes {
                 n.consensus
+                    .store
                     .bft_round_state
                     .timeout
                     .state
-                    .schedule_next(TimestampMsClock::now() - Duration::from_secs(10));
+                    .schedule_next(
+                        TimestampMsClock::now() - Duration::from_secs(10),
+                        Duration::from_secs(5),
+                    );
                 n.consensus
                     .handle_command(ConsensusCommand::TimeoutTick)
                     .await
@@ -2289,7 +2296,16 @@ pub mod test {
 
         let mut bc = TestBC::new_from_bus(node.bus.new_handle()).await;
 
-        node.wait_for_genesis_event().await.unwrap();
+        let GenesisEvent::GenesisBlock(block) = node.wait_for_genesis_event().await.unwrap() else {
+            panic!("Expected a GenesisBlock event");
+        };
+
+        let block = NodeState {
+            metrics: NodeStateMetrics::global("test".to_string(), "test"),
+            store: NodeStateStore::default(),
+        }
+        .handle_signed_block(&block)
+        .unwrap();
 
         // Check that we haven't started the consensus yet
         // (this is awkward to do for now so assume that not receiving an answer is OK)
@@ -2300,7 +2316,7 @@ pub mod test {
             }
         }
 
-        bc.send(NodeStateEvent::NewBlock(Box::default())).unwrap();
+        bc.send(NodeStateEvent::NewBlock(Box::new(block))).unwrap();
 
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(1)) => {

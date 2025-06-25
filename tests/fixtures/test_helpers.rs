@@ -34,6 +34,7 @@ impl ConfMaker {
         let tcp_port = find_available_port().await;
         let rest_port = find_available_port().await;
         let ws_port = find_available_port().await;
+        let admin_port = find_available_port().await;
 
         Conf {
             id: if prefix == "single-node" {
@@ -51,6 +52,7 @@ impl ConfMaker {
                 },
                 ..self.default.p2p.clone()
             },
+            admin_server_port: admin_port,
             da_server_port: da_port,
             da_public_address: format!("127.0.0.1:{}", da_port),
             tcp_server_port: tcp_port,
@@ -77,7 +79,7 @@ impl Default for ConfMaker {
             stakers.insert("node-2".to_owned(), 100);
             stakers
         };
-        default.genesis.faucet_password = "password".into();
+        default.genesis.keep_tokens_in_faucet = true; // Keep faucet tokens for tests
 
         default.run_indexer = false; // disable indexer by default to avoid needed PG
 

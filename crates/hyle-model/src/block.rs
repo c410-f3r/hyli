@@ -23,13 +23,17 @@ pub struct Block {
     pub successful_txs: Vec<TxHash>,
     pub failed_txs: Vec<TxHash>,
     pub timed_out_txs: Vec<TxHash>,
+    pub dropped_duplicate_txs: Vec<TxId>,
     pub blob_proof_outputs: Vec<HandledBlobProofOutput>,
     pub verified_blobs: Vec<(TxHash, BlobIndex, Option<usize>)>,
     pub new_bounded_validators: Vec<ValidatorPublicKey>,
     pub staking_actions: Vec<(Identity, StakingAction)>,
-    pub registered_contracts: Vec<(TxHash, RegisterContractEffect, Option<Vec<u8>>)>,
-    pub deleted_contracts: Vec<(TxHash, ContractName)>,
+    pub registered_contracts:
+        BTreeMap<ContractName, (TxHash, RegisterContractEffect, Option<Vec<u8>>)>,
+    pub deleted_contracts: BTreeMap<ContractName, TxHash>,
     pub updated_states: BTreeMap<ContractName, StateCommitment>,
+    pub updated_program_ids: BTreeMap<ContractName, ProgramId>,
+    pub updated_timeout_windows: BTreeMap<ContractName, TimeoutWindow>,
     pub transactions_events: BTreeMap<TxHash, Vec<TransactionStateEvent>>,
 }
 

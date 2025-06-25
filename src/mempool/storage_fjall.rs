@@ -7,13 +7,16 @@ use fjall::{
 };
 use futures::Stream;
 use hyle_model::LaneId;
-use tracing::info;
+use tracing::{debug, info};
 
-use crate::model::{DataProposal, DataProposalHash, Hashed};
+use crate::{
+    mempool::storage::MetadataOrMissingHash,
+    model::{DataProposal, DataProposalHash, Hashed},
+};
 use hyle_modules::log_warn;
 
 use super::{
-    storage::{CanBePutOnTop, LaneEntryMetadata, Storage},
+    storage::{CanBePutOnTop, EntryOrMissingHash, LaneEntryMetadata, Storage},
     ValidatorDAG,
 };
 
@@ -168,7 +171,11 @@ impl Storage for LanesStorage {
             bail!("DataProposal {} was already in lane", dp_hash);
         }
 
-        match self.can_be_put_on_top(&lane_id, lane_entry.parent_data_proposal_hash.as_ref()) {
+        match self.can_be_put_on_top(
+            &lane_id,
+            &dp_hash,
+            lane_entry.parent_data_proposal_hash.as_ref(),
+        ) {
             CanBePutOnTop::No => bail!(
                 "Can't store DataProposal {}, as parent is unknown ",
                 dp_hash
@@ -198,6 +205,18 @@ impl Storage for LanesStorage {
                     last_known_hash,
                     lane_entry.parent_data_proposal_hash
                 )
+            }
+            CanBePutOnTop::AlreadyOnTop => {
+                // This can happen if the lane tip is updated (via a commit) before the data proposal arrived.
+                self.by_hash_metadata.insert(
+                    format!("{}:{}", lane_id, dp_hash),
+                    encode_metadata_to_item(lane_entry)?,
+                )?;
+                self.by_hash_data.insert(
+                    format!("{}:{}", lane_id, dp_hash),
+                    encode_data_proposal_to_item(data_proposal)?,
+                )?;
+                Ok(())
             }
         }
     }
@@ -293,7 +312,11 @@ impl Storage for LanesStorage {
         lane_id: &LaneId,
         from_data_proposal_hash: Option<DataProposalHash>,
         to_data_proposal_hash: Option<DataProposalHash>,
-    ) -> impl Stream<Item = anyhow::Result<(LaneEntryMetadata, DataProposal)>> {
+    ) -> impl Stream<Item = anyhow::Result<EntryOrMissingHash>> {
+        debug!(
+            "Getting entries between hashes for lane {}: from {:?} to {:?}",
+            lane_id, from_data_proposal_hash, to_data_proposal_hash
+        );
         let metadata_stream = self.get_entries_metadata_between_hashes(
             lane_id,
             from_data_proposal_hash,
@@ -302,13 +325,24 @@ impl Storage for LanesStorage {
 
         try_stream! {
             for await md in metadata_stream {
-                let (metadata, dp_hash) = md?;
+                match md? {
+                    MetadataOrMissingHash::Metadata(metadata, dp_hash) => {
+                        match self.get_dp_by_hash(lane_id, &dp_hash)? {
+                            Some(data_proposal) => {
+                                yield EntryOrMissingHash::Entry(metadata, data_proposal);
+                            }
+                            None => {
+                                yield EntryOrMissingHash::MissingHash(dp_hash);
+                                break;
+                            }
+                        }
+                    }
 
-                let data_proposal = self.get_dp_by_hash(lane_id, &dp_hash)?.ok_or_else(|| {
-                    anyhow::anyhow!("Data proposal {} not found in lane {}", dp_hash, lane_id)
-                })?;
-
-                yield (metadata, data_proposal);
+                    MetadataOrMissingHash::MissingHash(hash) =>  {
+                        yield EntryOrMissingHash::MissingHash(hash);
+                        break;
+                    }
+                }
             }
         }
     }

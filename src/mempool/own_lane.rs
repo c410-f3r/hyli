@@ -1,5 +1,6 @@
 //! Logic for processing the API inbound TXs in the mempool.
 
+use crate::mempool::storage::MetadataOrMissingHash;
 use crate::{bus::BusClientSender, model::*};
 
 use anyhow::{bail, Context, Result};
@@ -118,7 +119,12 @@ impl super::Mempool {
             Box::pin(cloned_lanes.get_pending_entries_in_lane(&own_lane_id, last_cut));
 
         while let Some(stream_entry) = entries_stream.next().await {
-            let (entry_metadata, dp_hash) = stream_entry?;
+            let MetadataOrMissingHash::Metadata(entry_metadata, dp_hash) = stream_entry? else {
+                bail!(
+                    "DataProposal not retrieved for dissemination in lane {}",
+                    self.own_lane_id()
+                );
+            };
             // If only_dp_with_hash is Some, we only disseminate that one, skip all others.
             if let Some(ref only_dp_with_hash) = only_dp_with_hash {
                 if &dp_hash != only_dp_with_hash {
@@ -221,7 +227,7 @@ impl super::Mempool {
 
         let mut cumulative_size = 0;
         let mut current_idx = 0;
-        while cumulative_size < 40_000 && current_idx < self.waiting_dissemination_txs.len() {
+        while cumulative_size < 40_000_000 && current_idx < self.waiting_dissemination_txs.len() {
             if let Some((_tx_hash, tx)) = self.waiting_dissemination_txs.get_index(current_idx) {
                 cumulative_size += tx.estimate_size();
                 current_idx += 1;
@@ -269,8 +275,12 @@ impl super::Mempool {
             .map(|tx| tx.metadata(parent_data_proposal_hash.clone()))
             .collect();
 
+        // Brittle logic - some TXs might have been skipped over due to size limits.
+        // This means their WaitingDissemination status will not be updated (as their TxId effectively changes).
+        // Listeners might need to update any TX with this DPHash as parent and _not_ withing txs_metadatas.
         self.bus
             .send(MempoolStatusEvent::DataProposalCreated {
+                parent_data_proposal_hash,
                 data_proposal_hash: data_proposal.hashed(),
                 txs_metadatas,
             })
@@ -322,6 +332,12 @@ impl super::Mempool {
         match tx.transaction_data {
             TransactionData::Blob(ref blob_tx) => {
                 debug!("Got new blob tx {}", tx.hashed());
+                if blob_tx.blobs.len() > 20 {
+                    bail!(
+                        "Blob transaction has too many blobs: {}",
+                        blob_tx.blobs.len()
+                    );
+                }
                 // TODO: we should check if the registration handler contract exists.
                 // TODO: would be good to not need to clone here.
                 self.handle_hyle_contract_registration(blob_tx);
@@ -535,7 +551,7 @@ pub mod test {
 
         assert_chanmsg_matches!(
             ctx.mempool_status_event_receiver,
-            MempoolStatusEvent::DataProposalCreated { data_proposal_hash, txs_metadatas } => {
+            MempoolStatusEvent::DataProposalCreated { data_proposal_hash, txs_metadatas, .. } => {
                 assert_eq!(data_proposal_hash, dp.hashed());
                 assert_eq!(txs_metadatas.len(), dp.txs.len());
                 assert_eq!(txs_metadatas.len(), 3);
